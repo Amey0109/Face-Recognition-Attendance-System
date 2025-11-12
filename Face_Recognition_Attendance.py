@@ -18,11 +18,11 @@ DB_CONFIG = {
     "host": "localhost",
     "port": "5432"
 }
-DATASET_PATH = "Students" 
-PREDICTOR_PATH = "shape_predictor_68_face_landmarks.dat"
+DATASET_PATH = os.path.join(os.path.dirname(__file__), "Students")
+PREDICTOR_PATH = os.path.join(os.path.dirname(__file__), "shape_predictor_68_face_landmarks.dat")
 EAR_THRESHOLD = 0.25
 EAR_CONSEC_FRAMES = 1
-BLINK_WINDOW_SECONDS = 3  
+BLINK_WINDOW_SECONDS = 3
 FACE_DISTANCE_THRESHOLD = 0.6
 CAM_WIDTH = 640
 CAM_HEIGHT = 480
@@ -70,7 +70,7 @@ predictor = dlib.shape_predictor(PREDICTOR_PATH)
 (rStart, rEnd) = face_utils.FACIAL_LANDMARKS_IDXS["right_eye"]
 
 # Blink + marking states
-blink_counter = 0
+blink_counter = {}
 last_blink_time = {}
 marked_today = set()  # names already marked today
 
@@ -118,9 +118,8 @@ if not video.isOpened():
     update_notification("Could not open webcam", "red")
     raise SystemExit("Webcam not available")
 
+# --- Main frame processing ---
 def process_frame():
-    global blink_counter
-
     ret, frame = video.read()
     if not ret:
         update_notification("Failed to read from webcam", "red")
@@ -132,33 +131,13 @@ def process_frame():
     small_frame = cv2.resize(rgb, (0, 0), fx=0.5, fy=0.5)
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-    # Blink detection
     rects = detector(gray, 0)
-    blink_detected = False
-    for rect in rects:
-        shape = predictor(gray, rect)
-        shape = face_utils.shape_to_np(shape)
-        leftEAR = eye_aspect_ratio(shape[lStart:lEnd])
-        rightEAR = eye_aspect_ratio(shape[rStart:rEnd])
-        ear = (leftEAR + rightEAR) / 2.0
-        status_label.config(text=f"EAR: {ear:.3f}")
 
-        if ear < EAR_THRESHOLD:
-            blink_counter += 1
-        else:
-            if blink_counter >= EAR_CONSEC_FRAMES:
-                for name in known_names:
-                    last_blink_time[name] = datetime.now()
-                blink_detected = True
-                update_notification("Blink detected", "blue")
-            blink_counter = 0
-
-    # Face recognition
+    # Face recognition first
     face_locations = face_recognition.face_locations(small_frame)
     face_encodings = face_recognition.face_encodings(small_frame, face_locations)
 
-    if not face_locations:
-        update_notification("No face detected", "black")
+    recognized_faces = []  # Track recognized names this frame
 
     for (top, right, bottom, left), face_encoding in zip(face_locations, face_encodings):
         top *= 2; right *= 2; bottom *= 2; left *= 2
@@ -170,36 +149,76 @@ def process_frame():
             if face_distances[best_idx] < FACE_DISTANCE_THRESHOLD:
                 name = known_names[best_idx]
 
-        # Draw face box
+        recognized_faces.append((name, (top, right, bottom, left)))
+
+    # Blink detection for each detected face
+    for rect in rects:
+        shape = predictor(gray, rect)
+        shape = face_utils.shape_to_np(shape)
+        leftEAR = eye_aspect_ratio(shape[lStart:lEnd])
+        rightEAR = eye_aspect_ratio(shape[rStart:rEnd])
+        ear = (leftEAR + rightEAR) / 2.0
+        status_label.config(text=f"EAR: {ear:.3f}")
+
+        (x, y, w, h) = face_utils.rect_to_bb(rect)
+        center_x = x + w // 2
+        center_y = y + h // 2
+
+        # Find which recognized face this rect corresponds to
+        matched_name = None
+        for name, (top, right, bottom, left) in recognized_faces:
+            if left < center_x < right and top < center_y < bottom:
+                matched_name = name
+                break
+
+        if not matched_name or matched_name == "Unknown":
+            continue
+
+        # Blink detection per person
+        if matched_name not in last_blink_time:
+            last_blink_time[matched_name] = None
+        if matched_name not in blink_counter:
+            blink_counter[matched_name] = 0
+
+        if ear < EAR_THRESHOLD:
+            blink_counter[matched_name] += 1
+        else:
+            if blink_counter[matched_name] >= EAR_CONSEC_FRAMES:
+                last_blink_time[matched_name] = datetime.now()
+                update_notification(f"{matched_name} blink detected", "blue")
+            blink_counter[matched_name] = 0
+
+    # Attendance marking
+    for name, (top, right, bottom, left) in recognized_faces:
         color = (0, 0, 255) if name == "Unknown" else (0, 255, 0)
         cv2.rectangle(frame, (left, top), (right, bottom), color, 2)
         cv2.putText(frame, name, (left, top - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
 
         if name == "Unknown":
-            update_notification("Face not matched ", "red")
-        else:
-            last_time = last_blink_time.get(name, None)
-            if last_time and datetime.now() - last_time <= timedelta(seconds=BLINK_WINDOW_SECONDS):
-                if name not in marked_today:
-                    try:
-                        cursor.execute(
-                            "INSERT INTO attendance (name, timestamp) VALUES (%s, %s)",
-                            (name, datetime.now())
-                        )
-                        conn.commit()
-                        marked_today.add(name)
-                        update_notification(f"Hey {name}, your attendance has been marked", "green")
-                    except Exception as e:
-                        conn.rollback()
-                        update_notification(f"DB Error: {e}", "red")
-                else:
-                    update_notification(f"{name} already marked today", "orange")
-            else:
-                if name not in marked_today:
-                    update_notification(f"{name} recognized — blink to mark", "orange")
+            continue
 
-    # Show frame
-    img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)  
+        last_time = last_blink_time.get(name, None)
+        if last_time and datetime.now() - last_time <= timedelta(seconds=BLINK_WINDOW_SECONDS):
+            if name not in marked_today:
+                try:
+                    cursor.execute(
+                        "INSERT INTO attendance (name, timestamp) VALUES (%s, %s)",
+                        (name, datetime.now())
+                    )
+                    conn.commit()
+                    marked_today.add(name)
+                    update_notification(f"{name} attendance marked", "green")
+                except Exception as e:
+                    conn.rollback()
+                    update_notification(f"DB Error: {e}", "red")
+            else:
+                update_notification(f"{name} already marked today", "orange")
+        else:
+            if name not in marked_today:
+                update_notification(f"{name} recognized — blink to mark", "orange")
+
+    # Display frame
+    img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     img = Image.fromarray(img)
     imgtk = ImageTk.PhotoImage(image=img)
     camera_label.imgtk = imgtk
